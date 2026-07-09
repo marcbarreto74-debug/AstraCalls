@@ -144,6 +144,8 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		s.waContainer = container
 		s.waDB = db
 		s.setWebhook(row.Webhook)
+		s.setRecording(row.Recording)
+		s.setProxy(row.Proxy)
 		if row.Chatwoot != "" {
 			var cfg ChatwootConfig
 			if json.Unmarshal([]byte(row.Chatwoot), &cfg) == nil {
@@ -244,6 +246,26 @@ func (m *SessionManager) Pair(id string) error {
 	m.broker.emitSessionList(m.infos())
 	m.log.Info("session re-pairing", "session", id)
 	return nil
+}
+
+// PairPhone inicia o pareamento por CÓDIGO (sem QR) e devolve o código de 8
+// dígitos que o usuário digita no WhatsApp do aparelho.
+func (m *SessionManager) PairPhone(id, phone string) (string, error) {
+	s, ok := m.Get(id)
+	if !ok {
+		return "", fmt.Errorf("no session %s", id)
+	}
+	if s.client.Store.ID != nil {
+		return "", fmt.Errorf("session already paired")
+	}
+	s.replaceClient(whatsmeow.NewClient(s.waContainer.NewDevice(), m.waLogger))
+	code, err := s.startPhonePairing(m.appCtx, phone)
+	if err != nil {
+		return "", fmt.Errorf("start phone pairing: %w", err)
+	}
+	m.broker.emitSessionList(m.infos())
+	m.log.Info("session phone-pairing", "session", id)
+	return code, nil
 }
 
 func (m *SessionManager) disconnectAll() {

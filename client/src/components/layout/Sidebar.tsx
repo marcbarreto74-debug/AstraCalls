@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { Loader2, Plus, Trash2 } from "lucide-react";
+import { Loader2, Plus, Trash2, KeyRound } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
 import { setActiveSession, useSessions } from "@/stores/sessions";
 import { createSession, deleteSession } from "@/services/sessions";
+import { EXTENSION_DOWNLOAD_URL } from "@/lib/passkey";
 import type { SessionInfo, SessionState } from "@/types/session";
 
 const dotClass: Record<SessionState, string> = {
@@ -13,6 +14,8 @@ const dotClass: Record<SessionState, string> = {
   qr: "bg-amber-500",
   connecting: "bg-muted-foreground/50",
   logged_out: "bg-destructive",
+  pairing_code: "bg-amber-500",
+  passkey_request: "bg-sky-400",
 };
 
 export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
@@ -43,9 +46,20 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
   };
 
   return (
-    <div className="flex h-full flex-col gap-2 p-3">
-      <p className="px-2 pt-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Accounts</p>
-      <div className="flex-1 space-y-1 overflow-y-auto">
+    <div className="flex h-full flex-col gap-1 p-3">
+      <div className="flex items-center px-2 pb-3 pt-1">
+        <span className="inline-flex dark:rounded-lg dark:bg-white dark:px-2 dark:py-1.5">
+          <img src="/logoCalls.png" alt="AstraCalls" className="h-7 w-auto select-none" draggable={false} />
+        </span>
+      </div>
+      <Button className="w-full" onClick={onNew} disabled={creating}>
+        {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+        Nova conta
+      </Button>
+      <p className="px-3 pb-1 pt-4 text-[0.68rem] font-semibold uppercase tracking-wider text-muted-foreground">
+        Contas
+      </p>
+      <div className="flex-1 space-y-1 overflow-y-auto pr-0.5">
         {sessions.map((s) => (
           <div
             key={s.id}
@@ -56,11 +70,13 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
               onNavigate?.();
             }}
             className={cn(
-              "group flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm",
-              s.id === activeId ? "bg-accent text-accent-foreground" : "hover:bg-muted",
+              "group flex cursor-pointer items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors",
+              s.id === activeId
+                ? "bg-accent font-medium text-accent-foreground"
+                : "text-foreground/70 hover:bg-muted",
             )}
           >
-            <span className={cn("h-2 w-2 shrink-0 rounded-full", dotClass[s.state])} />
+            <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-card", dotClass[s.state])} />
             <div className="min-w-0 flex-1">
               <p className="truncate font-medium">{s.name}</p>
               {s.jid && <p className="truncate text-xs text-muted-foreground">{s.jid.split("@")[0]}</p>}
@@ -71,25 +87,33 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
                 setToDelete(s);
               }}
               className="text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-              aria-label={`Delete ${s.name}`}
+              aria-label={`Excluir ${s.name}`}
             >
               <Trash2 className="h-4 w-4" />
             </button>
           </div>
         ))}
-        {sessions.length === 0 && <p className="px-2 text-sm text-muted-foreground">No accounts yet.</p>}
+        {sessions.length === 0 && (
+          <p className="px-3 py-2 text-sm text-muted-foreground">Nenhuma conta ainda.</p>
+        )}
       </div>
-      <Button variant="outline" className="w-full" onClick={onNew} disabled={creating}>
-        {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-        New session
-      </Button>
+
+      <a
+        href={EXTENSION_DOWNLOAD_URL}
+        download
+        className="mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        title="Necessária apenas para conectar contas protegidas por passkey"
+      >
+        <KeyRound className="h-3.5 w-3.5 shrink-0" />
+        Extensão Passkey (.zip)
+      </a>
 
       <ConfirmDialog
         open={!!toDelete}
         onOpenChange={(o) => !o && setToDelete(null)}
-        title="Delete account?"
-        description={toDelete ? `${toDelete.name} will be logged out and removed.` : undefined}
-        confirmLabel="Delete"
+        title="Excluir conta?"
+        description={toDelete ? `${toDelete.name} será desconectada e removida.` : undefined}
+        confirmLabel="Excluir"
         destructive
         onConfirm={() => {
           if (toDelete) void remove(toDelete.id);

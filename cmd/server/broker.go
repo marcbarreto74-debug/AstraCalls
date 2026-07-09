@@ -29,17 +29,20 @@ type CallRecord struct {
 }
 
 type AuthSnapshot struct {
-	State  string `json:"state"`
-	Paired bool   `json:"paired"`
-	QR     string `json:"qr,omitempty"`
+	State   string          `json:"state"`
+	Paired  bool            `json:"paired"`
+	QR      string          `json:"qr,omitempty"`
+	Code    string          `json:"code,omitempty"`    // código de pareamento por telefone (8 dígitos)
+	Passkey json.RawMessage `json:"passkey,omitempty"` // desafio WebAuthn (publicKey) p/ contas com passkey
 }
 
 type SessionInfo struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	JID    string `json:"jid"`
-	State  string `json:"state"`
-	Paired bool   `json:"paired"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	JID       string `json:"jid"`
+	State     string `json:"state"`
+	Paired    bool   `json:"paired"`
+	Recording bool   `json:"recording"`
 }
 
 type subscriber struct {
@@ -94,10 +97,14 @@ func (b *Broker) broadcast(ev any) {
 }
 
 func (b *Broker) emitAuthState(sessionID string, a AuthSnapshot) {
-	b.broadcast(map[string]any{
+	ev := map[string]any{
 		"type": "auth-state", "sessionId": sessionID,
 		"paired": a.Paired, "state": a.State, "qr": a.QR,
-	})
+	}
+	if len(a.Passkey) > 0 {
+		ev["passkey"] = a.Passkey // desafio WebAuthn p/ contas com passkey
+	}
+	b.broadcast(ev)
 }
 
 func (b *Broker) emitSessionList(sessions []SessionInfo) {

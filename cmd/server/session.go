@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -33,14 +35,53 @@ type Session struct {
 	client *whatsmeow.Client
 	reg    *callRegistry
 
-	// store próprio desta sessão (1 banco por sessão, estilo WAHA)
+	// store próprio desta sessão (1 banco por sessão)
 	waContainer *sqlstore.Container
 	waDB        *sql.DB
 
-	mu       sync.Mutex
-	auth     AuthSnapshot
-	webhook  string
-	chatwoot ChatwootConfig
+	mu        sync.Mutex
+	auth      AuthSnapshot
+	webhook   string
+	chatwoot  ChatwootConfig
+	recording bool   // grava as chamadas desta sessão (opt-in)
+	proxy     string // proxy de saída da conexão WhatsApp (http/https/socks5)
+
+	// sentIDs guarda os IDs de mensagens que ESTE cliente enviou (via API ou
+	// pelo agente do Chatwoot), para não espelhá-las como nota privada quando
+	// voltarem como evento from_me. msgID -> unixMilli.
+	sentIDs sync.Map
+}
+
+// markSelfSent registra uma mensagem enviada por nós (com prune do que é antigo).
+func (s *Session) markSelfSent(id string) {
+	if id == "" {
+		return
+	}
+	now := time.Now().UnixMilli()
+	s.sentIDs.Store(id, now)
+	s.sentIDs.Range(func(k, v any) bool {
+		if ts, ok := v.(int64); ok && now-ts > 10*60*1000 {
+			s.sentIDs.Delete(k)
+		}
+		return true
+	})
+}
+
+// isSelfSent diz se a mensagem foi enviada por nós (API/agente), não pelo aparelho.
+func (s *Session) isSelfSent(id string) bool {
+	_, ok := s.sentIDs.Load(id)
+	return ok
+}
+
+// sendAndMark envia uma mensagem, a registra como "enviada por nós" e devolve o
+// ID da mensagem do WhatsApp (usado p/ gravar o source_id no Chatwoot).
+func (s *Session) sendAndMark(ctx context.Context, jid types.JID, msg *waE2E.Message) (string, error) {
+	resp, err := s.client.SendMessage(ctx, jid, msg)
+	if err != nil {
+		return "", err
+	}
+	s.markSelfSent(resp.ID)
+	return resp.ID, nil
 }
 
 func (s *Session) setWebhook(url string) {
@@ -67,6 +108,51 @@ func (s *Session) getChatwoot() ChatwootConfig {
 	return s.chatwoot
 }
 
+func (s *Session) setRecording(on bool) {
+	s.mu.Lock()
+	s.recording = on
+	s.mu.Unlock()
+}
+
+func (s *Session) getRecording() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recording
+}
+
+func (s *Session) setProxy(url string) {
+	s.mu.Lock()
+	s.proxy = url
+	s.mu.Unlock()
+}
+
+func (s *Session) getProxy() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.proxy
+}
+
+// applyProxy aplica o proxy configurado ao client whatsmeow. Precisa rodar ANTES
+// do Connect(); trocar depois exige reconnect() (o whatsmeow só relê no dial).
+func (s *Session) applyProxy() {
+	addr := s.getProxy()
+	if err := s.client.SetProxyAddress(addr); err != nil {
+		s.log.Warn("proxy inválido, conectando sem proxy", "err", err)
+	}
+}
+
+// reconnect derruba e reconecta a sessão pareada para o novo proxy valer.
+func (s *Session) reconnect() {
+	if s.client.Store.ID == nil {
+		return // não pareada: o proxy será aplicado no próximo pareamento
+	}
+	s.client.Disconnect()
+	s.applyProxy()
+	if err := s.client.Connect(); err != nil {
+		s.log.Error("reconexão após troca de proxy falhou", "err", err)
+	}
+}
+
 func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) *Session {
 	s := &Session{
 		id:     id,
@@ -84,7 +170,11 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 func (s *Session) createCall(callID string) *call.CallManager {
 	cm := call.NewCallManager(wa.NewSocket(s.client), s.log)
 	s.wireCall(cm, callID)
-	s.reg.add(callID, &activeCall{cm: cm})
+	ac := &activeCall{cm: cm}
+	if s.getRecording() {
+		ac.recorder = newCallRecorder(callID, s.log, time.Now())
+	}
+	s.reg.add(callID, ac)
 	return cm
 }
 
@@ -123,7 +213,12 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 	cm.OnPeerAudio = func(pcm16 []float32) {
 		ac, ok := s.reg.get(callID)
-		if !ok || ac.bridge == nil || ac.browserOpus == nil {
+		if !ok {
+			return
+		}
+		// grava o lado do peer (WhatsApp) mesmo se o navegador ainda não estiver pronto
+		ac.recorder.writePeer(pcm16)
+		if ac.bridge == nil || ac.browserOpus == nil {
 			return
 		}
 		pcm48 := media.Upsample16to48(pcm16)
@@ -192,8 +287,24 @@ func (s *Session) handleEvent(rawEvt any) {
 	case *events.LoggedOut:
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 	case *events.Message:
-		s.dispatchWebhook("message", summarizeMessage(evt))
-		go s.chatwootPushIncoming(evt)
+		switch {
+		case evt.Message.GetPollUpdateMessage() != nil:
+			go s.handleIncomingPollVote(evt) // voto em enquete (decodifica + encaminha)
+		case evt.Message.GetEncEventResponseMessage() != nil:
+			go s.handleIncomingEventResponse(evt) // RSVP de evento (decodifica + encaminha)
+		case evt.Message.GetReactionMessage() != nil || evt.Message.GetEncReactionMessage() != nil:
+			go s.handleIncomingReaction(evt) // reação (emoji) numa mensagem
+		default:
+			s.storeMessageEvent(evt)
+			s.dispatchWebhook("message", summarizeMessage(evt))
+			go s.chatwootPushIncoming(evt)
+		}
+	case *events.UndecryptableMessage:
+		// visualização única chega como placeholder "unavailable" — o WhatsApp não
+		// libera o conteúdo p/ dispositivos vinculados. Avisa o atendente/webhook.
+		if evt.IsUnavailable && evt.UnavailableType == events.UnavailableTypeViewOnce {
+			go s.handleUnavailableViewOnce(evt)
+		}
 	case *events.Receipt:
 		s.dispatchWebhook("receipt", map[string]any{
 			"chat": evt.Chat.String(), "sender": evt.Sender.String(),
@@ -222,6 +333,7 @@ func (s *Session) handleEvent(rawEvt any) {
 }
 
 func (s *Session) connect(ctx context.Context) error {
+	s.applyProxy()
 	if s.client.Store.ID != nil {
 		return s.client.Connect()
 	}
@@ -229,6 +341,7 @@ func (s *Session) connect(ctx context.Context) error {
 }
 
 func (s *Session) startPairing(ctx context.Context) error {
+	s.applyProxy()
 	qrChan, err := s.client.GetQRChannel(ctx)
 	if err != nil {
 		return err
@@ -251,10 +364,53 @@ func (s *Session) startPairing(ctx context.Context) error {
 				s.setAuth(AuthSnapshot{State: "open", Paired: true})
 			case "timeout":
 				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
+			case "passkey-request":
+				// conta com passkey: o WhatsApp exige uma prova WebAuthn do dono.
+				// Expõe o desafio pro front (que delega ao autenticador via extensão)
+				// e recebe a assinatura de volta em POST .../pair-passkey.
+				s.setPasskeyChallenge(evt.PasskeyRequest.PublicKey)
+			case "passkey-confirmation":
+				// handoff manual: confirma o código exibido no WhatsApp do dono.
+				if err := s.client.SendPasskeyConfirmation(s.mgr.appCtx); err != nil {
+					s.log.Warn("passkey: confirmação falhou", "err", err)
+				}
+			case "error":
+				s.log.Warn("pareamento: erro", "err", evt.Error)
 			}
 		}
 	}()
 	return nil
+}
+
+// setPasskeyChallenge serializa o desafio WebAuthn e o publica no estado de auth
+// (via SSE), no mesmo modelo do QR. O front repassa esse objeto ao autenticador
+// (navigator.credentials.get) na origem web.whatsapp.com através da extensão.
+func (s *Session) setPasskeyChallenge(pk *types.WebAuthnPublicKey) {
+	if pk == nil {
+		return
+	}
+	raw, err := json.Marshal(pk)
+	if err != nil {
+		s.log.Warn("passkey: falha ao serializar desafio", "err", err)
+		return
+	}
+	s.setAuth(AuthSnapshot{State: "passkey_request", Passkey: raw})
+}
+
+// startPhonePairing conecta um device novo e solicita um código de pareamento
+// por telefone (o usuário digita o código no WhatsApp: Aparelhos conectados ->
+// Conectar com número). O sucesso chega depois via events.Connected.
+func (s *Session) startPhonePairing(ctx context.Context, phone string) (string, error) {
+	s.applyProxy()
+	if err := s.client.Connect(); err != nil {
+		return "", err
+	}
+	code, err := s.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "AstraCalls")
+	if err != nil {
+		return "", err
+	}
+	s.setAuth(AuthSnapshot{State: "pairing_code", Code: code})
+	return code, nil
 }
 
 func (s *Session) setAuth(a AuthSnapshot) {
@@ -268,12 +424,13 @@ func (s *Session) setAuth(a AuthSnapshot) {
 func (s *Session) info() SessionInfo {
 	s.mu.Lock()
 	a := s.auth
+	rec := s.recording
 	s.mu.Unlock()
 	jid := ""
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", Recording: rec}
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
@@ -298,12 +455,36 @@ func (s *Session) removeCall(callID string) {
 	if !ok {
 		return
 	}
+	s.finalizeRecording(ac)
 	if ac.bridge != nil {
 		ac.bridge.Close()
 	}
 	if ac.browserOpus != nil {
 		ac.browserOpus.Close()
 	}
+}
+
+// finalizeRecording encerra a gravação (encode MP3) e entrega o áudio (Chatwoot
+// + webhook). Roda em goroutine pois o encode (ffmpeg) é lento e não pode segurar
+// o teardown. finish() é idempotente, então é seguro chamar pelos dois caminhos
+// de término (removeCall / teardownAllCalls).
+func (s *Session) finalizeRecording(ac *activeCall) {
+	if ac == nil || ac.recorder == nil {
+		return
+	}
+	rec := ac.recorder
+	callID := rec.callID
+	peer := ""
+	if cr, ok := s.mgr.broker.getCall(callID); ok && cr != nil {
+		peer = cr.Peer
+	}
+	go func() {
+		path, seconds, ok := rec.finish()
+		if !ok {
+			return
+		}
+		s.onRecordingReady(callID, peer, path, seconds)
+	}()
 }
 
 func (s *Session) terminateCall(callID string, reason core.EndCallReason) {
@@ -317,6 +498,7 @@ func (s *Session) terminateCall(callID string, reason core.EndCallReason) {
 func (s *Session) teardownAllCalls() {
 	for _, ac := range s.reg.drain() {
 		_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+		s.finalizeRecording(ac)
 		if ac.bridge != nil {
 			ac.bridge.Close()
 		}

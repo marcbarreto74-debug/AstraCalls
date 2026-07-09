@@ -10,6 +10,7 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -29,12 +31,23 @@ import (
 
 const cwChatIDAttr = "wacalls_chat_id"
 
+// isGroupChatID diz se um identifier/chatID é de um grupo (@g.us). Usado para não
+// reutilizar contatos de grupo legado em conversas 1:1 (fix @diegotiemann, PR #11).
+func isGroupChatID(id string) bool {
+	return strings.HasSuffix(id, "@g.us")
+}
+
 type ChatwootConfig struct {
 	URL             string `json:"url"`
 	AccountID       int    `json:"account_id"`
 	AccountToken    string `json:"account_token"`
 	InboxID         int    `json:"inbox_id"`
 	InboxIdentifier string `json:"inbox_identifier"`
+	// Groups: quando true, mensagens de GRUPO também abrem/atualizam uma conversa
+	// no Chatwoot (o "contato" é o próprio grupo; cada mensagem é prefixada com o
+	// autor). Channels: idem para CANAIS (newsletters).
+	Groups   bool `json:"groups"`
+	Channels bool `json:"channels"`
 }
 
 func (c ChatwootConfig) valid() bool {
@@ -90,9 +103,67 @@ func (s *Session) realPhone(jid types.JID) string {
 
 func (s *Session) chatwootPushIncoming(evt *events.Message) {
 	cfg := s.getChatwoot()
-	if !cfg.valid() || evt.Info.IsFromMe || evt.Info.IsGroup {
+	if !cfg.valid() {
 		return
 	}
+	if evt.Info.IsFromMe {
+		// espelha as mensagens 1:1 que a conta enviou PELO APARELHO (como nota
+		// privada). Ignora as que saíram pela nossa API / pelo agente do Chatwoot.
+		switch evt.Info.Chat.Server {
+		case types.DefaultUserServer, types.HiddenUserServer:
+			if !s.isSelfSent(evt.Info.ID) {
+				s.chatwootMirrorOwn(cfg, evt)
+			}
+		}
+		return
+	}
+	switch evt.Info.Chat.Server {
+	case types.GroupServer:
+		if cfg.Groups {
+			s.chatwootPushGroup(cfg, evt)
+		}
+	case types.NewsletterServer:
+		if cfg.Channels {
+			s.chatwootPushChannel(cfg, evt)
+		}
+	case types.DefaultUserServer, types.HiddenUserServer:
+		s.chatwootPushDirect(cfg, evt)
+	}
+}
+
+// chatwootMirrorOwn espelha, como NOTA PRIVADA, uma mensagem 1:1 que a conta
+// enviou pelo aparelho — para o agente ver no Chatwoot o que foi dito por fora.
+// Não é reenviado ao contato (nota privada não dispara o webhook de saída).
+func (s *Session) chatwootMirrorOwn(cfg ChatwootConfig, evt *events.Message) {
+	chat := evt.Info.Chat // numa msg from_me 1:1, o Chat é o destinatário
+	phone := chat.User
+	if chat.Server != types.DefaultUserServer {
+		if evt.Info.RecipientAlt.Server == types.DefaultUserServer && evt.Info.RecipientAlt.User != "" {
+			phone = evt.Info.RecipientAlt.User
+		} else {
+			phone = s.realPhone(chat)
+		}
+	}
+	chatID := phone + "@" + types.DefaultUserServer
+	avatar := ""
+	if pp, perr := s.client.GetProfilePictureInfo(context.Background(), chat, nil); perr == nil && pp != nil {
+		avatar = pp.URL
+	}
+	contactID, sourceID, err := cfg.ensureContact(chatID, phone, phone, avatar)
+	if err != nil {
+		s.log.Error("chatwoot: ensure contact (espelho) failed", "err", err)
+		return
+	}
+	convID, err := cfg.ensureConversation(contactID, sourceID)
+	if err != nil {
+		s.log.Error("chatwoot: ensure conversation (espelho) failed", "err", err)
+		return
+	}
+	s.chatwootDeliver(cfg, convID, evt, "", true)
+}
+
+// chatwootPushDirect trata a conversa 1:1 (comportamento original).
+func (s *Session) chatwootPushDirect(cfg ChatwootConfig, evt *events.Message) {
 	// telefone real (PN), nunca o LID
 	chat := evt.Info.Chat
 	phone := chat.User
@@ -123,24 +194,101 @@ func (s *Session) chatwootPushIncoming(evt *events.Message) {
 		s.log.Error("chatwoot: ensure conversation failed", "err", err)
 		return
 	}
+	s.chatwootDeliver(cfg, convID, evt, "", false)
+}
 
+// chatwootPushGroup abre/atualiza uma conversa no Chatwoot para um GRUPO. O
+// "contato" é o próprio grupo (identificado pelo JID @g.us) e cada mensagem é
+// prefixada com o nome/telefone de quem escreveu, já que a inbox tem 1 contato
+// por conversa.
+func (s *Session) chatwootPushGroup(cfg ChatwootConfig, evt *events.Message) {
+	group := evt.Info.Chat
+	chatID := group.String() // 1203...@g.us
+	name := chatID
+	if gi, err := s.client.GetGroupInfo(context.Background(), group); err == nil && gi.Name != "" {
+		name = gi.Name
+	}
+	avatar := ""
+	if pp, perr := s.client.GetProfilePictureInfo(context.Background(), group, nil); perr == nil && pp != nil {
+		avatar = pp.URL
+	}
+	contactID, sourceID, err := cfg.ensureContact(chatID, "", name, avatar)
+	if err != nil {
+		s.log.Error("chatwoot: ensure group contact failed", "err", err)
+		return
+	}
+	convID, err := cfg.ensureConversation(contactID, sourceID)
+	if err != nil {
+		s.log.Error("chatwoot: ensure group conversation failed", "err", err)
+		return
+	}
+	author := evt.Info.PushName
+	if author == "" {
+		author = s.realPhone(evt.Info.Sender)
+	}
+	s.chatwootDeliver(cfg, convID, evt, "*"+author+"*:\n", false)
+}
+
+// chatwootPushChannel abre/atualiza uma conversa no Chatwoot para um CANAL
+// (newsletter). O contato é o canal; as mensagens vêm do próprio canal, então
+// não há prefixo de autor.
+func (s *Session) chatwootPushChannel(cfg ChatwootConfig, evt *events.Message) {
+	channel := evt.Info.Chat
+	chatID := channel.String() // ...@newsletter
+	name := chatID
+	if ni, err := s.client.GetNewsletterInfo(context.Background(), channel); err == nil && ni.ThreadMeta.Name.Text != "" {
+		name = ni.ThreadMeta.Name.Text
+	}
+	contactID, sourceID, err := cfg.ensureContact(chatID, "", "📢 "+name, "")
+	if err != nil {
+		s.log.Error("chatwoot: ensure channel contact failed", "err", err)
+		return
+	}
+	convID, err := cfg.ensureConversation(contactID, sourceID)
+	if err != nil {
+		s.log.Error("chatwoot: ensure channel conversation failed", "err", err)
+		return
+	}
+	s.chatwootDeliver(cfg, convID, evt, "", false)
+}
+
+// chatwootDeliver baixa a mídia (se houver) e posta a mensagem na conversa.
+// prefix é acrescentado ao texto (usado em grupos p/ identificar o autor).
+func (s *Session) chatwootDeliver(cfg ChatwootConfig, convID int, evt *events.Message, prefix string, private bool) {
 	text := messageText(evt.Message)
-	// mídia recebida: baixa do WhatsApp e sobe pro Chatwoot como anexo
+	// visualização única: sinaliza pro atendente (a mídia baixa e sobe normal)
+	if _, viewOnce := unwrapViewOnce(evt.Message); viewOnce {
+		text = strings.TrimRight("👁️ _Visualização única_\n"+text, "\n")
+	}
+	// enquete: anexa o ID da mensagem (p/ referenciar no endpoint de voto)
+	if getPoll(evt.Message) != nil && evt.Info.ID != "" {
+		text += "\n_PID: " + evt.Info.ID + "_"
+	}
+	// evento: anexa o ID da mensagem (p/ referenciar no endpoint de RSVP)
+	if evt.Message.GetEventMessage() != nil && evt.Info.ID != "" {
+		text += "\n_EID: " + evt.Info.ID + "_"
+	}
+	// resposta com citação: source_id = ID da msg do WhatsApp; in_reply_to = a msg citada
+	sourceID := evt.Info.ID
+	inReplyTo := ""
+	if ci := messageContextInfo(evt.Message); ci != nil {
+		inReplyTo = ci.GetStanzaID()
+	}
+	// mídia: baixa do WhatsApp e sobe pro Chatwoot como anexo
 	if dl := downloadableOf(evt.Message); dl != nil {
 		data, derr := s.client.Download(context.Background(), dl)
 		if derr == nil && len(data) > 0 {
 			fname, mime := mediaMeta(evt.Message)
-			if uerr := cfg.postAttachment(convID, text, fname, mime, data); uerr != nil {
+			if uerr := cfg.postAttachment(convID, prefix+text, fname, mime, data, private, sourceID, inReplyTo); uerr != nil {
 				s.log.Error("chatwoot: post attachment failed", "err", uerr)
-			} else {
-				return
 			}
+			return
 		}
 	}
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	if err := cfg.postText(convID, text); err != nil {
+	if err := cfg.postText(convID, prefix+text, private, sourceID, inReplyTo); err != nil {
 		s.log.Error("chatwoot: post message failed", "err", err)
 	}
 }
@@ -148,12 +296,35 @@ func (s *Session) chatwootPushIncoming(evt *events.Message) {
 // avatarSynced evita re-sincronizar a foto a cada mensagem (1x por contato/processo).
 var avatarSynced sync.Map
 
-// ensureContact acha (por telefone) ou cria o contato e garante o source_id da inbox.
+// ensureContact acha (por telefone, ou por identifier quando phone == "" no caso
+// de grupos/canais) ou cria o contato e garante o source_id da inbox.
 func (c ChatwootConfig) ensureContact(chatID, phone, name, avatarURL string) (contactID int, sourceID string, err error) {
-	// procura por telefone
-	if res, code, e := c.req(http.MethodGet, "/contacts/search?q="+phone, nil); e == nil && code == 200 {
+	// grupos/canais não têm telefone -> busca pelo identifier (o JID)
+	query := phone
+	if query == "" {
+		query = chatID
+	}
+	if res, code, e := c.req(http.MethodGet, "/contacts/search?q="+url.QueryEscape(query), nil); e == nil && code == 200 {
 		for _, it := range asList(res["payload"]) {
 			m := asMap(it)
+			ident := asStr(m["identifier"])
+			attr := ""
+			if ca := asMap(m["custom_attributes"]); ca != nil {
+				attr = asStr(ca[cwChatIDAttr])
+			}
+			// Fix (@diegotiemann, PR #11): numa busca 1:1 por telefone, não
+			// reutilizar um contato de GRUPO legado ({phone}-{ts}@g.us) que casou
+			// pelo número.
+			if isGroupChatID(ident) && ident != chatID {
+				continue
+			}
+			if isGroupChatID(attr) && attr != chatID {
+				continue
+			}
+			// grupos/canais (busca por identifier): exige match exato do JID/attr.
+			if phone == "" && ident != chatID && attr != chatID {
+				continue
+			}
 			if id := asInt(m["id"]); id != 0 {
 				c.syncAvatar(id, avatarURL)
 				if sid := sourceIDForInbox(m, c.InboxID); sid != "" {
@@ -167,13 +338,15 @@ func (c ChatwootConfig) ensureContact(chatID, phone, name, avatarURL string) (co
 	}
 	// cria contato
 	body := map[string]any{
-		"inbox_id":     c.InboxID,
-		"name":         name,
-		"phone_number": "+" + phone,
-		"identifier":   chatID,
+		"inbox_id":   c.InboxID,
+		"name":       name,
+		"identifier": chatID,
 		"custom_attributes": map[string]any{
 			cwChatIDAttr: chatID,
 		},
+	}
+	if phone != "" {
+		body["phone_number"] = "+" + phone
 	}
 	if avatarURL != "" {
 		body["avatar_url"] = avatarURL
@@ -244,10 +417,20 @@ func (c ChatwootConfig) ensureConversation(contactID int, sourceID string) (int,
 	return asInt(res["id"]), nil
 }
 
-func (c ChatwootConfig) postText(convID int, content string) error {
-	_, code, e := c.req(http.MethodPost, fmt.Sprintf("/conversations/%d/messages", convID), map[string]any{
-		"content": content, "message_type": "incoming", "content_type": "text",
-	})
+func (c ChatwootConfig) postText(convID int, content string, private bool, sourceID, inReplyTo string) error {
+	body := map[string]any{"content": content, "message_type": "incoming", "content_type": "text"}
+	if private {
+		// nota privada: registro interno p/ o agente, não reenvia ao contato
+		body["message_type"] = "outgoing"
+		body["private"] = true
+	}
+	if sourceID != "" {
+		body["source_id"] = sourceID // = ID da msg do WhatsApp (elo p/ resposta)
+	}
+	if inReplyTo != "" {
+		body["content_attributes"] = map[string]any{"in_reply_to_external_id": inReplyTo}
+	}
+	_, code, e := c.req(http.MethodPost, fmt.Sprintf("/conversations/%d/messages", convID), body)
 	if e != nil {
 		return e
 	}
@@ -258,12 +441,24 @@ func (c ChatwootConfig) postText(convID int, content string) error {
 }
 
 // postAttachment sobe a mídia como anexo (multipart) numa mensagem incoming.
-func (c ChatwootConfig) postAttachment(convID int, content, filename, mime string, data []byte) error {
+func (c ChatwootConfig) postAttachment(convID int, content, filename, mime string, data []byte, private bool, sourceID, inReplyTo string) error {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	_ = mw.WriteField("message_type", "incoming")
+	if private {
+		_ = mw.WriteField("message_type", "outgoing")
+		_ = mw.WriteField("private", "true")
+	} else {
+		_ = mw.WriteField("message_type", "incoming")
+	}
 	if content != "" {
 		_ = mw.WriteField("content", content)
+	}
+	if sourceID != "" {
+		_ = mw.WriteField("source_id", sourceID)
+	}
+	if inReplyTo != "" {
+		ca, _ := json.Marshal(map[string]string{"in_reply_to_external_id": inReplyTo})
+		_ = mw.WriteField("content_attributes", string(ca))
 	}
 	h := make(map[string][]string)
 	h["Content-Disposition"] = []string{fmt.Sprintf(`form-data; name="attachments[]"; filename=%q`, filename)}
@@ -327,9 +522,24 @@ func (s *server) handleChatwootWebhook(w http.ResponseWriter, r *http.Request) {
 	attachments := asList(body["attachments"])
 	ctx := r.Context()
 
-	// texto (só envia separado se não houver exatamente 1 anexo, igual ao WAHA)
+	// se o agente respondeu uma mensagem, monta o contexto de citação
+	quote := sess.quoteContext(ctx, body)
+
+	var waMsgID string // ID da 1ª msg do WhatsApp enviada (vira source_id no Chatwoot)
+
+	// texto (só envia separado se não houver exatamente 1 anexo)
 	if strings.TrimSpace(content) != "" && len(attachments) != 1 {
-		_, _ = sess.client.SendMessage(ctx, jid, &waE2E.Message{Conversation: proto.String(content)})
+		var msg *waE2E.Message
+		if quote != nil {
+			msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: proto.String(content), ContextInfo: quote,
+			}}
+		} else {
+			msg = &waE2E.Message{Conversation: proto.String(content)}
+		}
+		if id, e := sess.sendAndMark(ctx, jid, msg); e == nil {
+			waMsgID = id
+		}
 	}
 	// anexos
 	for _, it := range attachments {
@@ -342,32 +552,110 @@ func (s *server) handleChatwootWebhook(w http.ResponseWriter, r *http.Request) {
 		if len(attachments) == 1 {
 			caption = content
 		}
-		if err := sess.sendChatwootFile(ctx, jid, asStr(a["file_type"]), url, caption); err != nil {
-			s.log.Error("chatwoot->wa: send file failed", "err", err)
+		id, ferr := sess.sendChatwootFile(ctx, jid, asStr(a["file_type"]), url, caption, quote)
+		if ferr != nil {
+			s.log.Error("chatwoot->wa: send file failed", "err", ferr)
+		} else if waMsgID == "" {
+			waMsgID = id
+		}
+	}
+	// grava o source_id na mensagem de SAÍDA do Chatwoot (amarra citação cliente->agente)
+	if waMsgID != "" {
+		if cwMsgID := asInt(body["id"]); cwMsgID != 0 {
+			go sess.setMessageSourceID(cwMsgID, waMsgID)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// sendChatwootFile baixa o anexo do Chatwoot e envia pelo WhatsApp.
-func (s *Session) sendChatwootFile(ctx context.Context, jid types.JID, fileType, url, caption string) error {
+// quoteContext monta o ContextInfo de citação a partir do webhook do Chatwoot.
+// Usa in_reply_to_external_id (o ID da msg do WhatsApp que setamos como source_id);
+// se vier só in_reply_to (id da msg no Chatwoot), resolve o source_id via API.
+func (s *Session) quoteContext(ctx context.Context, body map[string]any) *waE2E.ContextInfo {
+	ca := asMap(body["content_attributes"])
+	if ca == nil {
+		return nil
+	}
+	extID := asStr(ca["in_reply_to_external_id"])
+	if extID == "" {
+		if rid := asInt(ca["in_reply_to"]); rid != 0 {
+			convID := asInt(asMap(body["conversation"])["id"])
+			extID = s.getChatwoot().messageSourceID(convID, rid)
+		}
+	}
+	if extID == "" {
+		return nil
+	}
+	_, senderStr, _, raw, err := s.mgr.store.findMessage(ctx, s.id, extID)
+	if err != nil {
+		return nil
+	}
+	ci := &waE2E.ContextInfo{StanzaID: proto.String(extID)}
+	if senderStr != "" {
+		ci.Participant = proto.String(senderStr)
+	}
+	if len(raw) > 0 {
+		var qm waE2E.Message
+		if protojson.Unmarshal(raw, &qm) == nil {
+			ci.QuotedMessage = &qm
+		}
+	}
+	return ci
+}
+
+// setMessageSourceID grava o ID da msg do WhatsApp como source_id da mensagem de
+// SAÍDA no Chatwoot (endpoint custom do dev), p/ amarrar a citação quando o
+// cliente responde uma mensagem do agente. Fire-and-forget.
+func (s *Session) setMessageSourceID(chatwootMsgID int, sourceID string) {
+	cfg := s.getChatwoot()
+	if !cfg.valid() {
+		return
+	}
+	_, code, err := cfg.req(http.MethodPost, "/kanban/connections/set_message_source_id", map[string]any{
+		"message_id": chatwootMsgID,
+		"source_id":  sourceID,
+	})
+	if err != nil {
+		s.log.Warn("chatwoot: set_message_source_id falhou", "err", err)
+	} else if code >= 300 {
+		s.log.Warn("chatwoot: set_message_source_id http", "code", code)
+	}
+}
+
+// messageSourceID busca o source_id (ID externo) de uma mensagem do Chatwoot.
+func (c ChatwootConfig) messageSourceID(convID, msgID int) string {
+	res, code, e := c.req(http.MethodGet, fmt.Sprintf("/conversations/%d/messages", convID), nil)
+	if e != nil || code != 200 {
+		return ""
+	}
+	for _, it := range asList(res["payload"]) {
+		m := asMap(it)
+		if asInt(m["id"]) == msgID {
+			return asStr(m["source_id"])
+		}
+	}
+	return ""
+}
+
+// sendChatwootFile baixa o anexo do Chatwoot e envia pelo WhatsApp (com citação opcional).
+func (s *Session) sendChatwootFile(ctx context.Context, jid types.JID, fileType, url, caption string, quote *waE2E.ContextInfo) (string, error) {
 	data, err := fetchMedia("", url)
 	if err != nil {
-		return err
+		return "", err
 	}
 	filename := url[strings.LastIndex(url, "/")+1:]
 	switch fileType {
 	case "image":
 		up, e := s.client.Upload(ctx, data, whatsmeow.MediaImage)
 		if e != nil {
-			return e
+			return "", e
 		}
-		_, e = s.client.SendMessage(ctx, jid, &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		return s.sendAndMark(ctx, jid, &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 			Caption: proto.String(caption), Mimetype: proto.String("image/jpeg"),
 			URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			ContextInfo: quote,
 		}})
-		return e
 	case "audio":
 		ogg, seconds, waveform, terr := transcodeVoice(data)
 		if terr != nil {
@@ -375,42 +663,42 @@ func (s *Session) sendChatwootFile(ctx context.Context, jid types.JID, fileType,
 		}
 		up, e := s.client.Upload(ctx, ogg, whatsmeow.MediaAudio)
 		if e != nil {
-			return e
+			return "", e
 		}
 		am := &waE2E.AudioMessage{
 			Mimetype: proto.String("audio/ogg; codecs=opus"), PTT: proto.Bool(true),
 			URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			ContextInfo: quote,
 		}
 		if terr == nil {
 			am.Seconds = proto.Uint32(seconds)
 			am.Waveform = waveform
 		}
-		_, e = s.client.SendMessage(ctx, jid, &waE2E.Message{AudioMessage: am})
-		return e
+		return s.sendAndMark(ctx, jid, &waE2E.Message{AudioMessage: am})
 	case "video":
 		up, e := s.client.Upload(ctx, data, whatsmeow.MediaVideo)
 		if e != nil {
-			return e
+			return "", e
 		}
-		_, e = s.client.SendMessage(ctx, jid, &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+		return s.sendAndMark(ctx, jid, &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
 			Caption: proto.String(caption), Mimetype: proto.String("video/mp4"),
 			URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			ContextInfo: quote,
 		}})
-		return e
 	default:
 		up, e := s.client.Upload(ctx, data, whatsmeow.MediaDocument)
 		if e != nil {
-			return e
+			return "", e
 		}
-		_, e = s.client.SendMessage(ctx, jid, &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		return s.sendAndMark(ctx, jid, &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
 			FileName: proto.String(filename), Title: proto.String(filename),
 			Mimetype: proto.String("application/octet-stream"),
 			URL:      &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			ContextInfo: quote,
 		}})
-		return e
 	}
 }
 
@@ -496,11 +784,13 @@ func chatIDFromWebhook(body map[string]any) string {
 			return v
 		}
 	}
-	if ph := asStr(sender["phone_number"]); ph != "" {
-		return strings.TrimPrefix(ph, "+")
-	}
+	// Fix (@diegotiemann, PR #11): prioriza o identifier (que guarda o JID de
+	// grupo/canal) sobre o phone_number.
 	if id := asStr(sender["identifier"]); id != "" {
 		return id
+	}
+	if ph := asStr(sender["phone_number"]); ph != "" {
+		return strings.TrimPrefix(ph, "+")
 	}
 	return ""
 }
@@ -541,7 +831,8 @@ func (s *server) handleChatwootResolve(w http.ResponseWriter, r *http.Request) {
 	phone := ""
 	if ca := asMap(sender["custom_attributes"]); ca != nil {
 		raw := asStr(ca[cwChatIDAttr])
-		if raw != "" {
+		// Fix (@diegotiemann, PR #11): grupo não tem telefone p/ o widget de chamada.
+		if raw != "" && !isGroupChatID(raw) {
 			if jid, e := types.ParseJID(raw); e == nil {
 				phone = sess.realPhone(jid) // converte LID->PN se necessário
 			} else {
@@ -607,6 +898,74 @@ func (s *server) handleGetChatwoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"chatwoot": cfg, "enabled": sess.getChatwoot().valid()})
 }
 
+// handleChatwootOpenGroup cria/garante um contato + conversa no Chatwoot para um
+// grupo, sob demanda (sem esperar chegar mensagem). Requer Chatwoot configurado.
+func (s *server) handleChatwootOpenGroup(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	cfg := sess.getChatwoot()
+	if !cfg.valid() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "chatwoot não configurado nesta sessão"})
+		return
+	}
+	gid, err := resolveGroupJID(r.PathValue("gid"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	chatID := gid.String()
+	name := chatID
+	if gi, e := sess.client.GetGroupInfo(r.Context(), gid); e == nil && gi.Name != "" {
+		name = gi.Name
+	}
+	avatar := ""
+	if pp, perr := sess.client.GetProfilePictureInfo(r.Context(), gid, nil); perr == nil && pp != nil {
+		avatar = pp.URL
+	}
+	s.openChatwootConversation(w, cfg, chatID, name, avatar)
+}
+
+// handleChatwootOpenChannel: idem para um canal (newsletter).
+func (s *server) handleChatwootOpenChannel(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	cfg := sess.getChatwoot()
+	if !cfg.valid() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "chatwoot não configurado nesta sessão"})
+		return
+	}
+	jid, err := resolveNewsletterJID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	chatID := jid.String()
+	name := chatID
+	if ni, e := sess.client.GetNewsletterInfo(r.Context(), jid); e == nil && ni.ThreadMeta.Name.Text != "" {
+		name = ni.ThreadMeta.Name.Text
+	}
+	s.openChatwootConversation(w, cfg, chatID, "📢 "+name, "")
+}
+
+// openChatwootConversation garante contato + conversa e devolve os ids.
+func (s *server) openChatwootConversation(w http.ResponseWriter, cfg ChatwootConfig, chatID, name, avatar string) {
+	contactID, sourceID, err := cfg.ensureContact(chatID, "", name, avatar)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	convID, err := cfg.ensureConversation(contactID, sourceID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"contactId": contactID, "conversationId": convID, "chatId": chatID})
+}
+
 func (s *server) handleDeleteChatwoot(w http.ResponseWriter, r *http.Request) {
 	sess := s.sessionByID(w, r.PathValue("sid"))
 	if sess == nil {
@@ -644,6 +1003,7 @@ func firstNonEmpty(a, b string) string {
 
 // downloadableOf devolve a parte de mídia da mensagem (ou nil se for texto).
 func downloadableOf(m *waE2E.Message) whatsmeow.DownloadableMessage {
+	m, _ = unwrapViewOnce(m)
 	switch {
 	case m.GetImageMessage() != nil:
 		return m.GetImageMessage()
@@ -653,12 +1013,20 @@ func downloadableOf(m *waE2E.Message) whatsmeow.DownloadableMessage {
 		return m.GetVideoMessage()
 	case m.GetDocumentMessage() != nil:
 		return m.GetDocumentMessage()
+	case m.GetStickerMessage() != nil:
+		return m.GetStickerMessage()
+	case m.GetProductMessage() != nil:
+		// a imagem do produto/catálogo vira anexo no Chatwoot
+		if img := productImage(m.GetProductMessage()); img != nil {
+			return img
+		}
 	}
 	return nil
 }
 
 // mediaMeta devolve (filename, mimetype) p/ a mídia recebida.
 func mediaMeta(m *waE2E.Message) (string, string) {
+	m, _ = unwrapViewOnce(m)
 	switch {
 	case m.GetImageMessage() != nil:
 		return "image.jpg", firstNonEmpty(m.GetImageMessage().GetMimetype(), "image/jpeg")
@@ -669,6 +1037,12 @@ func mediaMeta(m *waE2E.Message) (string, string) {
 	case m.GetDocumentMessage() != nil:
 		d := m.GetDocumentMessage()
 		return firstNonEmpty(d.GetFileName(), "file"), firstNonEmpty(d.GetMimetype(), "application/octet-stream")
+	case m.GetStickerMessage() != nil:
+		return "sticker.webp", firstNonEmpty(m.GetStickerMessage().GetMimetype(), "image/webp")
+	case m.GetProductMessage() != nil:
+		if img := productImage(m.GetProductMessage()); img != nil {
+			return "produto.jpg", firstNonEmpty(img.GetMimetype(), "image/jpeg")
+		}
 	}
 	return "file", "application/octet-stream"
 }
