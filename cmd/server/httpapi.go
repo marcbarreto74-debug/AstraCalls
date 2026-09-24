@@ -28,6 +28,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/pair-passkey", s.handlePairPasskey)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls", s.handleStartCall)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/webrtc", s.handleWebRTC)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/bridge-sip", s.handleBridgeSip)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/accept", s.handleAccept)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/reject", s.handleReject)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}", s.handleEndCall)
@@ -325,6 +326,40 @@ func (s *server) handleAccept(w http.ResponseWriter, r *http.Request) {
 	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
 		s.doAccept(sess, w, r)
 	}
+}
+
+// handleBridgeSip anexa a perna do Asterisk (externalMedia) à chamada: a partir
+// daqui o áudio do WhatsApp vai pro Asterisk (ramal SIP) em vez do browser.
+// Body: { asterisk_host, asterisk_port } = UNICASTRTP_LOCAL_ADDRESS/PORT do canal.
+func (s *server) handleBridgeSip(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	callID := r.PathValue("id")
+	ac, ok := sess.reg.get(callID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var body struct {
+		AsteriskHost string `json:"asterisk_host"`
+		AsteriskPort int    `json:"asterisk_port"`
+		LocalPort    int    `json:"local_port"` // = external_host port do externalMedia
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.AsteriskHost == "" || body.AsteriskPort == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "asterisk_host and asterisk_port required"})
+		return
+	}
+	leg, err := NewAsteriskLeg(body.AsteriskHost, body.AsteriskPort, body.LocalPort, ac.cm, s.log)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if old, ok := sess.reg.setAsteriskLeg(callID, leg); ok && old != nil {
+		old.Close()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *server) handleReject(w http.ResponseWriter, r *http.Request) {
